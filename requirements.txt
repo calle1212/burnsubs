@@ -1,0 +1,6 @@
+# No Python dependencies required - uses ffmpeg/ffprobe via subprocess
+# However, you need to have ffmpeg installed on your system:
+# - Windows: Download from https://ffmpeg.org/download.html or use chocolatey: choco install ffmpeg
+# - macOS: brew install ffmpeg
+# - Linux: sudo apt-get install ffmpeg (or equivalent for your distribution)
+
