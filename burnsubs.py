@@ -27,48 +27,47 @@ except ImportError:
     TKINTER_AVAILABLE = False
 
 
-def get_subtitle_tracks(video_path):
-    """Extract subtitle track information from video file using ffprobe."""
+def get_all_tracks(video_path):
+    """Extract both subtitle and audio track information in a single ffprobe call."""
     try:
+        # Get all streams and filter by codec_type (more reliable than select_streams syntax)
         cmd = [
             'ffprobe',
             '-v', 'quiet',
             '-print_format', 'json',
             '-show_streams',
-            '-select_streams', 's',
             video_path
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         data = json.loads(result.stdout)
-        return data.get('streams', [])
+        streams = data.get('streams', [])
+        
+        # Separate into subtitle and audio tracks
+        subtitle_tracks = [s for s in streams if s.get('codec_type') == 'subtitle']
+        audio_tracks = [s for s in streams if s.get('codec_type') == 'audio']
+        
+        return subtitle_tracks, audio_tracks
     except subprocess.CalledProcessError as e:
         print(f"Error probing video file: {e}", file=sys.stderr)
-        return []
+        if e.stderr:
+            error_msg = e.stderr.decode() if isinstance(e.stderr, bytes) else e.stderr
+            print(f"ffprobe error: {error_msg}", file=sys.stderr)
+        return [], []
     except FileNotFoundError:
         print("Error: ffprobe not found. Please install ffmpeg.", file=sys.stderr)
         sys.exit(1)
+
+
+def get_subtitle_tracks(video_path):
+    """Extract subtitle track information from video file using ffprobe."""
+    subtitle_tracks, _ = get_all_tracks(video_path)
+    return subtitle_tracks
 
 
 def get_audio_tracks(video_path):
     """Extract audio track information from video file using ffprobe."""
-    try:
-        cmd = [
-            'ffprobe',
-            '-v', 'quiet',
-            '-print_format', 'json',
-            '-show_streams',
-            '-select_streams', 'a',
-            video_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        data = json.loads(result.stdout)
-        return data.get('streams', [])
-    except subprocess.CalledProcessError as e:
-        print(f"Error probing video file: {e}", file=sys.stderr)
-        return []
-    except FileNotFoundError:
-        print("Error: ffprobe not found. Please install ffmpeg.", file=sys.stderr)
-        sys.exit(1)
+    _, audio_tracks = get_all_tracks(video_path)
+    return audio_tracks
 
 
 def extract_subtitle_track(video_path, track_index, output_path):
@@ -120,8 +119,8 @@ def get_track_signature(tracks):
 def analyze_video_tracks(video_path):
     """Analyze subtitle and audio tracks for a video file."""
     try:
-        subtitle_tracks = get_subtitle_tracks(video_path)
-        audio_tracks = get_audio_tracks(video_path)
+        # Use single ffprobe call to get both track types
+        subtitle_tracks, audio_tracks = get_all_tracks(video_path)
         return {
             'subtitle_signature': get_track_signature(subtitle_tracks),
             'audio_signature': get_track_signature(audio_tracks),
@@ -136,15 +135,24 @@ def analyze_video_tracks(video_path):
 
 
 def group_videos_by_tracks(video_paths):
-    """Group videos by their track structure."""
+    """Group videos by their track structure. Parallelized for better performance."""
     print("\nAnalyzing video files...")
     video_info = {}
     
-    for video_path in video_paths:
-        info = analyze_video_tracks(video_path)
-        if info:
-            video_info[video_path] = info
-            print(f"  {os.path.basename(video_path)}: {info['subtitle_count']} subtitle(s), {info['audio_count']} audio track(s)")
+    # Parallelize track analysis
+    max_workers = min(cpu_count(), len(video_paths))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_path = {executor.submit(analyze_video_tracks, path): path for path in video_paths}
+        
+        for future in as_completed(future_to_path):
+            video_path = future_to_path[future]
+            try:
+                info = future.result()
+                if info:
+                    video_info[video_path] = info
+                    print(f"  {os.path.basename(video_path)}: {info['subtitle_count']} subtitle(s), {info['audio_count']} audio track(s)")
+            except Exception as e:
+                print(f"  Error analyzing {os.path.basename(video_path)}: {e}", file=sys.stderr)
     
     # Group by track signatures
     subtitle_groups = defaultdict(list)
@@ -300,13 +308,15 @@ progress_lock = threading.Lock()
 batch_progress = {}
 batch_progress_lock = threading.Lock()
 
+# Compile regex patterns once at module level for better performance
+DURATION_PATTERN = re.compile(r'Duration: (\d{2}:\d{2}:\d{2}\.\d{2})')
+TIME_PATTERN = re.compile(r'time=(\d{2}:\d{2}:\d{2}\.\d{2})')
+SPEED_PATTERN = re.compile(r'speed=\s*([\d.]+)x')
+
 def show_progress(process, total_duration=None, silent=False, file_name=None, update_callback=None):
     """Show progress bar while ffmpeg is running."""
     if silent:
         # For parallel processing, show progress with file name
-        duration_pattern = re.compile(r'Duration: (\d{2}:\d{2}:\d{2}\.\d{2})')
-        time_pattern = re.compile(r'time=(\d{2}:\d{2}:\d{2}\.\d{2})')
-        speed_pattern = re.compile(r'speed=\s*([\d.]+)x')
         
         duration_seconds = total_duration
         last_progress = 0
@@ -323,18 +333,18 @@ def show_progress(process, total_duration=None, silent=False, file_name=None, up
             
             # Try to get duration from output if not provided
             if duration_seconds is None:
-                duration_match = duration_pattern.search(line)
+                duration_match = DURATION_PATTERN.search(line)
                 if duration_match:
                     duration_seconds = parse_duration(duration_match.group(1))
             
             # Get current time
-            time_match = time_pattern.search(line)
+            time_match = TIME_PATTERN.search(line)
             if time_match and duration_seconds:
                 current_time = parse_time(time_match.group(1))
                 progress = min(current_time / duration_seconds, 1.0)
                 
                 # Get speed
-                speed_match = speed_pattern.search(line)
+                speed_match = SPEED_PATTERN.search(line)
                 speed = speed_match.group(1) if speed_match else "?"
                 
                 # Update progress bar with file name
@@ -359,7 +369,12 @@ def show_progress(process, total_duration=None, silent=False, file_name=None, up
                     
                     # Use callback if provided, otherwise update shared dict
                     if update_callback:
-                        update_callback(file_name, status_text)
+                        # Callback can be called with (file_name, status) or just (status)
+                        try:
+                            update_callback(file_name, status_text)
+                        except TypeError:
+                            # Fallback if callback only accepts one argument
+                            update_callback(status_text)
                     elif file_name:
                         with batch_progress_lock:
                             batch_progress[file_name] = status_text
@@ -369,10 +384,6 @@ def show_progress(process, total_duration=None, silent=False, file_name=None, up
         
         process.wait()
         return
-    
-    duration_pattern = re.compile(r'Duration: (\d{2}:\d{2}:\d{2}\.\d{2})')
-    time_pattern = re.compile(r'time=(\d{2}:\d{2}:\d{2}\.\d{2})')
-    speed_pattern = re.compile(r'speed=\s*([\d.]+)x')
     
     duration_seconds = total_duration
     last_progress = 0
@@ -388,18 +399,18 @@ def show_progress(process, total_duration=None, silent=False, file_name=None, up
         
         # Try to get duration from output if not provided
         if duration_seconds is None:
-            duration_match = duration_pattern.search(line)
+            duration_match = DURATION_PATTERN.search(line)
             if duration_match:
                 duration_seconds = parse_duration(duration_match.group(1))
         
         # Get current time
-        time_match = time_pattern.search(line)
+        time_match = TIME_PATTERN.search(line)
         if time_match and duration_seconds:
             current_time = parse_time(time_match.group(1))
             progress = min(current_time / duration_seconds, 1.0)
             
             # Get speed
-            speed_match = speed_pattern.search(line)
+            speed_match = SPEED_PATTERN.search(line)
             speed = speed_match.group(1) if speed_match else "?"
             
             # Update progress bar
@@ -425,6 +436,48 @@ def show_progress(process, total_duration=None, silent=False, file_name=None, up
     print()  # New line after progress
 
 
+def get_audio_codec_info(video_path, audio_track_index=None):
+    """Get audio codec information for a specific track or first audio track."""
+    try:
+        cmd = [
+            'ffprobe',
+            '-v', 'quiet',
+            '-print_format', 'json',
+            '-show_streams',
+            video_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        streams = data.get('streams', [])
+        
+        audio_streams = [s for s in streams if s.get('codec_type') == 'audio']
+        if not audio_streams:
+            return None, None
+        
+        # Select the appropriate audio stream
+        if audio_track_index is not None and audio_track_index < len(audio_streams):
+            selected_stream = audio_streams[audio_track_index]
+        else:
+            selected_stream = audio_streams[0]
+        
+        codec_name = selected_stream.get('codec_name', '')
+        channels = selected_stream.get('channels', 2)
+        
+        return codec_name, channels
+    except:
+        return None, None
+
+
+def should_convert_audio_to_aac(codec_name, output_path):
+    """Determine if audio should be converted to AAC for Chromecast compatibility."""
+    # Always convert to AAC for MP4 output to ensure Chromecast compatibility
+    if output_path.lower().endswith('.mp4'):
+        # Convert Opus and other non-AAC codecs to AAC
+        if codec_name and codec_name.lower() not in ['aac', 'mp3']:
+            return True
+    return False
+
+
 def burn_subtitles_from_file(video_path, subtitle_path, output_path, audio_track_index=None, silent=False, file_name=None, update_callback=None):
     """Burn subtitles from external subtitle file into video using ffmpeg."""
     try:
@@ -448,6 +501,10 @@ def burn_subtitles_from_file(video_path, subtitle_path, output_path, audio_track
             except:
                 total_duration = None
         
+        # Check if we need to convert audio to AAC for Chromecast compatibility
+        audio_codec, audio_channels = get_audio_codec_info(video_path, audio_track_index)
+        convert_audio = should_convert_audio_to_aac(audio_codec, output_path)
+        
         cmd = [
             'ffmpeg',
             '-i', video_path,
@@ -461,8 +518,19 @@ def burn_subtitles_from_file(video_path, subtitle_path, output_path, audio_track
         else:
             cmd.extend(['-map', '0:a?'])
         
+        # Set audio codec - convert to AAC if needed for Chromecast compatibility
+        if convert_audio:
+            # Use AAC with appropriate bitrate based on channel count
+            if audio_channels and audio_channels > 2:
+                # 5.1 or more channels - use higher bitrate
+                cmd.extend(['-c:a', 'aac', '-b:a', '256k'])
+            else:
+                # Stereo or mono - use standard bitrate
+                cmd.extend(['-c:a', 'aac', '-b:a', '192k'])
+        else:
+            cmd.extend(['-c:a', 'copy'])
+        
         cmd.extend([
-            '-c:a', 'copy',
             '-y',  # Overwrite output file
             output_path
         ])
@@ -513,6 +581,10 @@ def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_in
             except:
                 total_duration = None
         
+        # Check if we need to convert audio to AAC for Chromecast compatibility
+        audio_codec, audio_channels = get_audio_codec_info(video_path, audio_track_index)
+        convert_audio = should_convert_audio_to_aac(audio_codec, output_path)
+        
         cmd = [
             'ffmpeg',
             '-i', video_path,
@@ -525,10 +597,21 @@ def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_in
         else:
             cmd.extend(['-map', '0:a?'])
         
+        # Set audio codec - convert to AAC if needed for Chromecast compatibility
+        if convert_audio:
+            # Use AAC with appropriate bitrate based on channel count
+            if audio_channels and audio_channels > 2:
+                # 5.1 or more channels - use higher bitrate
+                cmd.extend(['-c:a', 'aac', '-b:a', '256k'])
+            else:
+                # Stereo or mono - use standard bitrate
+                cmd.extend(['-c:a', 'aac', '-b:a', '192k'])
+        else:
+            cmd.extend(['-c:a', 'copy'])
+        
         cmd.extend([
             '-vf', f"subtitles='{escaped_video_path}':si={track_index}",
             '-c:v', 'libx264',
-            '-c:a', 'copy',   # Don't re-encode audio
             '-y',  # Overwrite output file
             output_path
         ])
@@ -714,12 +797,7 @@ def process_batch_mkv(video_files):
         sys.exit(1)
     
     # Process in parallel
-    print("\n" + "="*60)
-    print(f"PROCESSING {len(processing_tasks)} FILE(S) IN PARALLEL")
-    print("="*60)
-    
     max_workers = min(cpu_count(), len(processing_tasks))
-    print(f"Using {max_workers} worker(s)...\n")
     
     # Initialize progress tracking
     file_names = [os.path.basename(task[0]) for task in processing_tasks]
@@ -729,8 +807,8 @@ def process_batch_mkv(video_files):
         for name in file_names:
             batch_progress[name] = "Starting..."
     
-    # Print initial header and file list
-    print("="*60)
+    # Print initial header and file list (only once)
+    print("\n" + "="*60)
     print(f"PROCESSING {len(processing_tasks)} FILE(S) IN PARALLEL")
     print("="*60)
     print(f"Using {max_workers} worker(s)...\n")
@@ -770,8 +848,13 @@ def process_batch_mkv(video_files):
         for task in processing_tasks:
             video_path = task[0]
             video_name = os.path.basename(video_path)
-            # Create callback for this specific file
-            callback = lambda name=video_name, status="": update_file_progress(name, status)
+            # Create callback for this specific file (use default parameter to avoid closure issue)
+            def make_callback(name):
+                # Callback accepts (file_name, status) but we use the captured name
+                def callback_func(file_name, status):
+                    update_file_progress(name, status)
+                return callback_func
+            callback = make_callback(video_name)
             task_with_callback = task + (callback,)
             future_to_video[executor.submit(process_single_video, task_with_callback)] = video_path
         
