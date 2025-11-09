@@ -12,10 +12,12 @@ import os
 import tempfile
 import json
 import re
+import time
 from pathlib import Path
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing import cpu_count
+import threading
 
 try:
     import tkinter as tk
@@ -248,19 +250,26 @@ def select_audio_track(video_path):
 
 def process_single_video(args_tuple):
     """Process a single video file. Used for parallel processing.
-    Args: (video_path, subtitle_track_index, audio_track_index, output_path, subtitle_file)
+    Args: (video_path, subtitle_track_index, audio_track_index, output_path, subtitle_file, update_callback)
     """
-    video_path, subtitle_track_index, audio_track_index, output_path, subtitle_file = args_tuple
+    # Handle both with and without callback
+    if len(args_tuple) == 6:
+        video_path, subtitle_track_index, audio_track_index, output_path, subtitle_file, update_callback = args_tuple
+    else:
+        video_path, subtitle_track_index, audio_track_index, output_path, subtitle_file = args_tuple
+        update_callback = None
+    
     try:
         video_path_resolved = str(Path(video_path).resolve())
+        file_name = os.path.basename(video_path)
         
         if subtitle_file:
             # External subtitle file
             subtitle_path = str(Path(subtitle_file).resolve())
-            success = burn_subtitles_from_file(video_path_resolved, subtitle_path, output_path, audio_track_index, silent=True)
+            success = burn_subtitles_from_file(video_path_resolved, subtitle_path, output_path, audio_track_index, silent=True, file_name=file_name, update_callback=update_callback)
         else:
             # Embedded subtitles
-            success = burn_subtitles_from_mkv(video_path_resolved, subtitle_track_index, output_path, audio_track_index, silent=True)
+            success = burn_subtitles_from_mkv(video_path_resolved, subtitle_track_index, output_path, audio_track_index, silent=True, file_name=file_name, update_callback=update_callback)
         
         return (video_path, output_path, success, None)
     except Exception as e:
@@ -284,15 +293,80 @@ def parse_time(time_str):
     return parse_duration(time_str)
 
 
-def show_progress(process, total_duration=None, silent=False):
+# Thread-safe print lock for progress updates
+progress_lock = threading.Lock()
+
+# Shared progress dictionary for batch processing
+batch_progress = {}
+batch_progress_lock = threading.Lock()
+
+def show_progress(process, total_duration=None, silent=False, file_name=None, update_callback=None):
     """Show progress bar while ffmpeg is running."""
     if silent:
-        # For parallel processing, consume stderr to prevent buffer overflow
-        # but don't display anything
+        # For parallel processing, show progress with file name
+        duration_pattern = re.compile(r'Duration: (\d{2}:\d{2}:\d{2}\.\d{2})')
+        time_pattern = re.compile(r'time=(\d{2}:\d{2}:\d{2}\.\d{2})')
+        speed_pattern = re.compile(r'speed=\s*([\d.]+)x')
+        
+        duration_seconds = total_duration
+        last_progress = 0
+        last_update_time = time.time()
+        
+        # Read stderr line by line
         while True:
             line = process.stderr.readline()
             if not line:
                 break
+            
+            if isinstance(line, bytes):
+                line = line.decode('utf-8', errors='ignore')
+            
+            # Try to get duration from output if not provided
+            if duration_seconds is None:
+                duration_match = duration_pattern.search(line)
+                if duration_match:
+                    duration_seconds = parse_duration(duration_match.group(1))
+            
+            # Get current time
+            time_match = time_pattern.search(line)
+            if time_match and duration_seconds:
+                current_time = parse_time(time_match.group(1))
+                progress = min(current_time / duration_seconds, 1.0)
+                
+                # Get speed
+                speed_match = speed_pattern.search(line)
+                speed = speed_match.group(1) if speed_match else "?"
+                
+                # Update progress bar with file name
+                bar_length = 30
+                filled = int(bar_length * progress)
+                bar = '=' * filled + '-' * (bar_length - filled)
+                percent = int(progress * 100)
+                
+                # Only update if progress changed significantly OR enough time has passed (max 2 seconds)
+                current_time_actual = time.time()
+                time_since_update = current_time_actual - last_update_time
+                should_update = (abs(progress - last_progress) > 0.05 or progress == 1.0) and time_since_update >= 0.5
+                
+                if should_update:
+                    remaining = (duration_seconds - current_time) / float(speed) if speed != "?" and speed != "0" else 0
+                    if remaining > 0:
+                        remaining_str = f"{int(remaining//60)}m {int(remaining%60)}s"
+                    else:
+                        remaining_str = "calculating..."
+                    
+                    status_text = f"[{bar}] {percent:3d}% | {speed}x | ETA: {remaining_str}"
+                    
+                    # Use callback if provided, otherwise update shared dict
+                    if update_callback:
+                        update_callback(file_name, status_text)
+                    elif file_name:
+                        with batch_progress_lock:
+                            batch_progress[file_name] = status_text
+                    
+                    last_progress = progress
+                    last_update_time = current_time_actual
+        
         process.wait()
         return
     
@@ -351,7 +425,7 @@ def show_progress(process, total_duration=None, silent=False):
     print()  # New line after progress
 
 
-def burn_subtitles_from_file(video_path, subtitle_path, output_path, audio_track_index=None, silent=False):
+def burn_subtitles_from_file(video_path, subtitle_path, output_path, audio_track_index=None, silent=False, file_name=None, update_callback=None):
     """Burn subtitles from external subtitle file into video using ffmpeg."""
     try:
         # Escape the subtitle path properly for ffmpeg
@@ -400,7 +474,7 @@ def burn_subtitles_from_file(video_path, subtitle_path, output_path, audio_track
             universal_newlines=False
         )
         
-        show_progress(process, total_duration, silent=silent)
+        show_progress(process, total_duration, silent=silent, file_name=file_name, update_callback=update_callback)
         process.wait()
         
         if process.returncode != 0:
@@ -417,7 +491,7 @@ def burn_subtitles_from_file(video_path, subtitle_path, output_path, audio_track
         sys.exit(1)
 
 
-def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_index=None, silent=False):
+def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_index=None, silent=False, file_name=None, update_callback=None):
     """Burn subtitles directly from MKV file using track index (more efficient)."""
     try:
         # Use the si parameter to select subtitle track directly from the video file
@@ -466,7 +540,7 @@ def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_in
             universal_newlines=False
         )
         
-        show_progress(process, total_duration, silent=silent)
+        show_progress(process, total_duration, silent=silent, file_name=file_name, update_callback=update_callback)
         process.wait()
         
         if process.returncode != 0:
@@ -647,12 +721,59 @@ def process_batch_mkv(video_files):
     max_workers = min(cpu_count(), len(processing_tasks))
     print(f"Using {max_workers} worker(s)...\n")
     
+    # Initialize progress tracking
+    file_names = [os.path.basename(task[0]) for task in processing_tasks]
+    file_line_map = {}  # Map file names to their line numbers
+    with batch_progress_lock:
+        batch_progress.clear()
+        for name in file_names:
+            batch_progress[name] = "Starting..."
+    
+    # Print initial header and file list
+    print("="*60)
+    print(f"PROCESSING {len(processing_tasks)} FILE(S) IN PARALLEL")
+    print("="*60)
+    print(f"Using {max_workers} worker(s)...\n")
+    
+    # Print each file on its own line and track line numbers
+    for idx, name in enumerate(file_names):
+        print(f"{name[:45]:<45} Starting...")
+        file_line_map[name] = idx + 5  # +5 for header lines above
+    sys.stdout.flush()
+    
+    def update_file_progress(file_name, status):
+        """Update progress for a specific file on its line."""
+        if file_name not in file_line_map:
+            return
+        
+        line_num = file_line_map[file_name]
+        # Move cursor to the line, clear it, and write new status
+        # Use ANSI escape codes: \033[nA moves up n lines, \033[K clears to end of line
+        # We need to calculate how many lines from bottom
+        total_lines = len(file_names) + 5
+        lines_from_bottom = total_lines - line_num
+        
+        with batch_progress_lock:
+            batch_progress[file_name] = status
+            # Move to beginning of line, clear it, write new content
+            print(f"\033[{lines_from_bottom}A\r\033[K{file_name[:45]:<45} {status}", end='', flush=True)
+            # Move cursor back down
+            if lines_from_bottom > 0:
+                print(f"\033[{lines_from_bottom}B", end='', flush=True)
+    
     completed = 0
     failed = []
     
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
-        future_to_video = {executor.submit(process_single_video, task): task[0] for task in processing_tasks}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks with update callback
+        future_to_video = {}
+        for task in processing_tasks:
+            video_path = task[0]
+            video_name = os.path.basename(video_path)
+            # Create callback for this specific file
+            callback = lambda name=video_name, status="": update_file_progress(name, status)
+            task_with_callback = task + (callback,)
+            future_to_video[executor.submit(process_single_video, task_with_callback)] = video_path
         
         # Process completed tasks
         for future in as_completed(future_to_video):
@@ -661,10 +782,13 @@ def process_batch_mkv(video_files):
             video_name = os.path.basename(video_path)
             
             if success:
-                print(f"[{completed}/{len(processing_tasks)}] ✓ {video_name} -> {os.path.basename(output_path)}")
+                update_file_progress(video_name, f"✓ Complete -> {os.path.basename(output_path)}")
             else:
-                print(f"[{completed}/{len(processing_tasks)}] ✗ {video_name} - Error: {error}", file=sys.stderr)
+                update_file_progress(video_name, f"✗ Error: {error}")
                 failed.append((video_path, error))
+    
+    # Move cursor to end
+    print("\n" + "="*60)
     
     # Summary
     print("\n" + "="*60)
