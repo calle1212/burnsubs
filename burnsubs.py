@@ -15,9 +15,6 @@ import re
 import time
 from pathlib import Path
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from multiprocessing import cpu_count
-import threading
 
 try:
     import tkinter as tk
@@ -91,6 +88,18 @@ def extract_subtitle_track(video_path, track_index, output_path):
         sys.exit(1)
 
 
+def is_image_based_subtitle(codec_name):
+    """Check if subtitle codec is image-based (not text-based)."""
+    image_based_codecs = [
+        'dvd_subtitle',      # VobSub
+        'hdmv_pgs_subtitle', # PGS
+        'dvb_subtitle',      # DVB
+        'xsub',              # XSUB
+        'vobsub'             # VobSub (alternative name)
+    ]
+    return codec_name.lower() in image_based_codecs
+
+
 def format_track_info(track, index):
     """Format track information for display."""
     tags = track.get('tags', {})
@@ -98,7 +107,8 @@ def format_track_info(track, index):
     title = tags.get('title', '')
     codec = track.get('codec_name', 'unknown')
     
-    info_parts = [f"Language: {lang}", f"Codec: {codec}"]
+    subtitle_type = " (Image-based)" if is_image_based_subtitle(codec) else ""
+    info_parts = [f"Language: {lang}", f"Codec: {codec}{subtitle_type}"]
     if title:
         info_parts.append(f"Title: {title}")
     
@@ -135,24 +145,19 @@ def analyze_video_tracks(video_path):
 
 
 def group_videos_by_tracks(video_paths):
-    """Group videos by their track structure. Parallelized for better performance."""
+    """Group videos by their track structure."""
     print("\nAnalyzing video files...")
     video_info = {}
     
-    # Parallelize track analysis
-    max_workers = min(cpu_count(), len(video_paths))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_path = {executor.submit(analyze_video_tracks, path): path for path in video_paths}
-        
-        for future in as_completed(future_to_path):
-            video_path = future_to_path[future]
-            try:
-                info = future.result()
-                if info:
-                    video_info[video_path] = info
-                    print(f"  {os.path.basename(video_path)}: {info['subtitle_count']} subtitle(s), {info['audio_count']} audio track(s)")
-            except Exception as e:
-                print(f"  Error analyzing {os.path.basename(video_path)}: {e}", file=sys.stderr)
+    # Process sequentially
+    for video_path in video_paths:
+        try:
+            info = analyze_video_tracks(video_path)
+            if info:
+                video_info[video_path] = info
+                print(f"  {os.path.basename(video_path)}: {info['subtitle_count']} subtitle(s), {info['audio_count']} audio track(s)")
+        except Exception as e:
+            print(f"  Error analyzing {os.path.basename(video_path)}: {e}", file=sys.stderr)
     
     # Group by track signatures
     subtitle_groups = defaultdict(list)
@@ -257,15 +262,17 @@ def select_audio_track(video_path):
 
 
 def process_single_video(args_tuple):
-    """Process a single video file. Used for parallel processing.
+    """Process a single video file. Used for sequential or parallel processing.
     Args: (video_path, subtitle_track_index, audio_track_index, output_path, subtitle_file, update_callback)
     """
     # Handle both with and without callback
     if len(args_tuple) == 6:
         video_path, subtitle_track_index, audio_track_index, output_path, subtitle_file, update_callback = args_tuple
+        silent = update_callback is not None  # Silent if callback provided (for parallel)
     else:
         video_path, subtitle_track_index, audio_track_index, output_path, subtitle_file = args_tuple
         update_callback = None
+        silent = False  # Show progress for sequential processing
     
     try:
         video_path_resolved = str(Path(video_path).resolve())
@@ -274,10 +281,10 @@ def process_single_video(args_tuple):
         if subtitle_file:
             # External subtitle file
             subtitle_path = str(Path(subtitle_file).resolve())
-            success = burn_subtitles_from_file(video_path_resolved, subtitle_path, output_path, audio_track_index, silent=True, file_name=file_name, update_callback=update_callback)
+            success = burn_subtitles_from_file(video_path_resolved, subtitle_path, output_path, audio_track_index, silent=silent, file_name=file_name, update_callback=update_callback)
         else:
             # Embedded subtitles
-            success = burn_subtitles_from_mkv(video_path_resolved, subtitle_track_index, output_path, audio_track_index, silent=True, file_name=file_name, update_callback=update_callback)
+            success = burn_subtitles_from_mkv(video_path_resolved, subtitle_track_index, output_path, audio_track_index, silent=silent, file_name=file_name, update_callback=update_callback)
         
         return (video_path, output_path, success, None)
     except Exception as e:
@@ -301,22 +308,18 @@ def parse_time(time_str):
     return parse_duration(time_str)
 
 
-# Thread-safe print lock for progress updates
-progress_lock = threading.Lock()
-
-# Shared progress dictionary for batch processing
-batch_progress = {}
-batch_progress_lock = threading.Lock()
-
 # Compile regex patterns once at module level for better performance
 DURATION_PATTERN = re.compile(r'Duration: (\d{2}:\d{2}:\d{2}\.\d{2})')
 TIME_PATTERN = re.compile(r'time=(\d{2}:\d{2}:\d{2}\.\d{2})')
 SPEED_PATTERN = re.compile(r'speed=\s*([\d.]+)x')
+# HandBrake progress patterns
+HANDBRAKE_PROGRESS_PATTERN = re.compile(r'Encoding: task \d+ of \d+, (\d+\.\d+) %')
+HANDBRAKE_FPS_PATTERN = re.compile(r'\((\d+\.\d+) fps\)')
 
 def show_progress(process, total_duration=None, silent=False, file_name=None, update_callback=None):
     """Show progress bar while ffmpeg is running."""
     if silent:
-        # For parallel processing, show progress with file name
+        # Silent mode with optional callback for custom progress display
         
         duration_seconds = total_duration
         last_progress = 0
@@ -367,7 +370,7 @@ def show_progress(process, total_duration=None, silent=False, file_name=None, up
                     
                     status_text = f"[{bar}] {percent:3d}% | {speed}x | ETA: {remaining_str}"
                     
-                    # Use callback if provided, otherwise update shared dict
+                    # Use callback if provided
                     if update_callback:
                         # Callback can be called with (file_name, status) or just (status)
                         try:
@@ -375,9 +378,6 @@ def show_progress(process, total_duration=None, silent=False, file_name=None, up
                         except TypeError:
                             # Fallback if callback only accepts one argument
                             update_callback(status_text)
-                    elif file_name:
-                        with batch_progress_lock:
-                            batch_progress[file_name] = status_text
                     
                     last_progress = progress
                     last_update_time = current_time_actual
@@ -559,11 +559,23 @@ def burn_subtitles_from_file(video_path, subtitle_path, output_path, audio_track
         sys.exit(1)
 
 
+def get_subtitle_codec(video_path, track_index):
+    """Get the codec name for a specific subtitle track."""
+    try:
+        subtitle_tracks, _ = get_all_tracks(video_path)
+        if track_index < len(subtitle_tracks):
+            return subtitle_tracks[track_index].get('codec_name', '')
+        return None
+    except:
+        return None
+
+
 def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_index=None, silent=False, file_name=None, update_callback=None):
     """Burn subtitles directly from MKV file using track index (more efficient)."""
     try:
-        # Use the si parameter to select subtitle track directly from the video file
-        escaped_video_path = video_path.replace('\\', '/').replace(':', '\\:')
+        # Check if subtitle is image-based
+        subtitle_codec = get_subtitle_codec(video_path, track_index)
+        is_image_based = is_image_based_subtitle(subtitle_codec) if subtitle_codec else False
         
         # Get video duration for progress bar (only if not silent)
         total_duration = None
@@ -609,12 +621,246 @@ def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_in
         else:
             cmd.extend(['-c:a', 'copy'])
         
-        cmd.extend([
-            '-vf', f"subtitles='{escaped_video_path}':si={track_index}",
-            '-c:v', 'libx264',
-            '-y',  # Overwrite output file
-            output_path
-        ])
+        # Handle image-based vs text-based subtitles differently
+        escaped_video_path = video_path.replace('\\', '/').replace(':', '\\:')
+        temp_sub_path = None
+        
+        # Check if this is VobSub - need special handling
+        is_vobsub = subtitle_codec and ('dvd_subtitle' in subtitle_codec.lower() or 'vobsub' in subtitle_codec.lower())
+        
+        if is_vobsub:
+            # For VobSub, FFmpeg's subtitles filter doesn't support it
+            # Try using HandBrake CLI if available (it supports VobSub)
+            try:
+                # Check if HandBrake CLI is available
+                handbrake_check = subprocess.run(['HandBrakeCLI', '--version'], 
+                                                 capture_output=True, text=True, timeout=5)
+                handbrake_available = True
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                handbrake_available = False
+            
+            if handbrake_available:
+                # Use HandBrake CLI to burn VobSub subtitles
+                if not silent:
+                    print("Using HandBrake CLI to process VobSub subtitles...")
+                
+                # HandBrake uses 1-based indexing for subtitles
+                # The track_index we have is 0-based, so convert to 1-based
+                # HandBrake should match the subtitle track order from the file
+                handbrake_subtitle_track = track_index + 1
+                
+                # Build HandBrake command
+                handbrake_cmd = [
+                    'HandBrakeCLI',
+                    '-i', video_path,
+                    '-o', output_path,
+                    '--subtitle', str(handbrake_subtitle_track),
+                    '--subtitle-burn',  # Burn the subtitle into the video
+                    '--encoder', 'x264',
+                    '--quality', '20',  # Good quality setting
+                ]
+                
+                # Add audio track selection
+                if audio_track_index is not None:
+                    # HandBrake uses 1-based audio track indexing
+                    handbrake_cmd.extend(['--audio', str(audio_track_index + 1)])
+                    if convert_audio:
+                        handbrake_cmd.extend(['--aencoder', 'av_aac'])
+                        if audio_channels and audio_channels > 2:
+                            handbrake_cmd.extend(['--ab', '256'])
+                        else:
+                            handbrake_cmd.extend(['--ab', '192'])
+                else:
+                    # Use first audio track
+                    handbrake_cmd.extend(['--audio', '1'])
+                    if convert_audio:
+                        handbrake_cmd.extend(['--aencoder', 'av_aac'])
+                
+                # Run HandBrake
+                process = subprocess.Popen(
+                    handbrake_cmd,
+                    stderr=subprocess.STDOUT,  # HandBrake outputs to stdout
+                    stdout=subprocess.PIPE,
+                    universal_newlines=False
+                )
+                
+                # HandBrake outputs progress differently - handle it separately
+                if not silent:
+                    print("Processing with HandBrake...")
+                
+                # Read HandBrake output and show progress
+                last_progress = 0
+                last_update_time = time.time()
+                
+                while True:
+                    line = process.stdout.readline()
+                    if not line:
+                        break
+                    
+                    if isinstance(line, bytes):
+                        line = line.decode('utf-8', errors='ignore')
+                    
+                    # Parse HandBrake progress (format: "Encoding: task 1 of 1, 45.23 % (23.45 fps)")
+                    progress_match = HANDBRAKE_PROGRESS_PATTERN.search(line)
+                    if progress_match:
+                        progress_pct = float(progress_match.group(1)) / 100.0
+                        fps_match = HANDBRAKE_FPS_PATTERN.search(line)
+                        fps = fps_match.group(1) if fps_match else "?"
+                        
+                        # Update progress display
+                        current_time_actual = time.time()
+                        time_since_update = current_time_actual - last_update_time
+                        should_update = (abs(progress_pct - last_progress) > 0.05 or progress_pct >= 1.0) and time_since_update >= 0.5
+                        
+                        if should_update:
+                            bar_length = 30
+                            filled = int(bar_length * progress_pct)
+                            bar = '=' * filled + '-' * (bar_length - filled)
+                            percent = int(progress_pct * 100)
+                            
+                            status_text = f"[{bar}] {percent:3d}% | {fps} fps"
+                            
+                            if update_callback:
+                                try:
+                                    update_callback(file_name, status_text)
+                                except TypeError:
+                                    update_callback(status_text)
+                            elif not silent:
+                                print(f"\rProgress: {status_text}", end='', flush=True)
+                            
+                            last_progress = progress_pct
+                            last_update_time = current_time_actual
+                    
+                    # Print important messages
+                    if 'error' in line.lower() or 'Error' in line:
+                        if not silent:
+                            print(f"\n{line.strip()}")
+                
+                if not silent:
+                    print()  # New line after progress
+                
+                process.wait()
+                
+                if process.returncode == 0:
+                    return True
+                else:
+                    if not silent:
+                        print(f"\nHandBrake processing failed. Trying FFmpeg fallback...", file=sys.stderr)
+                    # Fall through to FFmpeg attempt
+            
+            # If HandBrake not available or failed, try FFmpeg (will likely fail but worth trying)
+            if not silent:
+                if not handbrake_available:
+                    print(f"\nWarning: HandBrake CLI not found. VobSub subtitles may not work with FFmpeg.", file=sys.stderr)
+                print(f"Attempting FFmpeg workaround - this may not work...", file=sys.stderr)
+            
+            # Try extracting VobSub and using it - this likely won't work but worth trying
+            with tempfile.NamedTemporaryFile(suffix='.sub', delete=False) as temp_sub:
+                temp_sub_path = temp_sub.name
+            
+            try:
+                # Extract VobSub track
+                extract_cmd = [
+                    'ffmpeg',
+                    '-i', video_path,
+                    '-map', f'0:s:{track_index}',
+                    '-c:s', 'copy',
+                    '-y',
+                    temp_sub_path
+                ]
+                subprocess.run(extract_cmd, capture_output=True, text=True, check=True, timeout=60)
+                
+                # Try using extracted file - this will likely fail but worth trying
+                escaped_sub_path = temp_sub_path.replace('\\', '/').replace(':', '\\:')
+                cmd.extend([
+                    '-vf', f"subtitles='{escaped_sub_path}'",
+                    '-c:v', 'libx264',
+                    '-y',
+                    output_path
+                ])
+            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                # Clean up and provide helpful error
+                if temp_sub_path and os.path.exists(temp_sub_path):
+                    try:
+                        os.unlink(temp_sub_path)
+                    except:
+                        pass
+                temp_sub_path = None
+                
+                if not silent:
+                    error_msg = (
+                        f"\nError: Cannot process VobSub subtitles automatically.\n"
+                        f"FFmpeg does not support burning VobSub subtitles from MKV files.\n\n"
+                        f"To enable automatic VobSub support, install HandBrake CLI:\n"
+                        f"  1. Download from: https://handbrake.fr/downloads2.php\n"
+                        f"  2. Add HandBrakeCLI to your PATH\n"
+                        f"  3. Run this script again\n\n"
+                        f"Alternative options:\n"
+                        f"  - Extract subtitles manually and convert to SRT using Subtitle Edit\n"
+                        f"  - Use a different video file with text-based subtitles (SRT/ASS)\n"
+                    )
+                    print(error_msg, file=sys.stderr)
+                return False
+        elif is_image_based:
+            # For image-based subtitles (PGS, etc.), FFmpeg's subtitles filter can't read from MKV directly
+            # We need to extract first, then burn. For PGS, extract as .sup file
+            # Note: VobSub is handled separately above and returns early
+            
+            # Determine file extension based on codec
+            # PGS and other image-based formats use .sup
+            temp_ext = '.sup'
+            
+            with tempfile.NamedTemporaryFile(suffix=temp_ext, delete=False) as temp_sub:
+                temp_sub_path = temp_sub.name
+            
+            try:
+                # Extract PGS subtitle using ffmpeg
+                extract_cmd = [
+                    'ffmpeg',
+                    '-i', video_path,
+                    '-map', f'0:s:{track_index}',
+                    '-c:s', 'copy',
+                    '-y',
+                    temp_sub_path
+                ]
+                subprocess.run(extract_cmd, capture_output=True, text=True, check=True, timeout=60)
+                
+                # Now use the extracted file with subtitles filter
+                escaped_sub_path = temp_sub_path.replace('\\', '/').replace(':', '\\:')
+                cmd.extend([
+                    '-vf', f"subtitles='{escaped_sub_path}'",
+                    '-c:v', 'libx264',
+                    '-y',
+                    output_path
+                ])
+            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+                # Clean up on error
+                if temp_sub_path and os.path.exists(temp_sub_path):
+                    try:
+                        os.unlink(temp_sub_path)
+                    except:
+                        pass
+                # VobSub subtitles cannot be processed by FFmpeg's subtitles filter
+                # Provide helpful error message
+                if not silent:
+                    error_msg = (
+                        f"\nError: Cannot process image-based subtitle (VobSub/PGS) from MKV file.\n"
+                        f"FFmpeg's subtitles filter does not support VobSub subtitles in MKV containers.\n"
+                        f"Please either:\n"
+                        f"  1. Install MKVToolNix and ensure 'mkvextract' is in your PATH\n"
+                        f"  2. Extract the subtitle track manually and use it as an external subtitle file\n"
+                        f"  3. Convert the VobSub subtitles to a text-based format (SRT/ASS) first\n"
+                    )
+                    print(error_msg, file=sys.stderr)
+                raise subprocess.CalledProcessError(1, extract_cmd if 'extract_cmd' in locals() else [])
+        else:
+            # For text-based subtitles, use the subtitles filter directly
+            cmd.extend([
+                '-vf', f"subtitles='{escaped_video_path}':si={track_index}",
+                '-c:v', 'libx264',
+                '-y',  # Overwrite output file
+                output_path
+            ])
         
         process = subprocess.Popen(
             cmd,
@@ -625,6 +871,13 @@ def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_in
         
         show_progress(process, total_duration, silent=silent, file_name=file_name, update_callback=update_callback)
         process.wait()
+        
+        # Clean up temporary subtitle file if it was created
+        if 'temp_sub_path' in locals() and temp_sub_path and os.path.exists(temp_sub_path):
+            try:
+                os.unlink(temp_sub_path)
+            except:
+                pass
         
         if process.returncode != 0:
             raise subprocess.CalledProcessError(process.returncode, cmd)
@@ -668,7 +921,8 @@ def pick_files():
     print("(Hold Ctrl/Cmd to select multiple files)")
     video_files = filedialog.askopenfilenames(
         title="Select Video File(s)",
-        filetypes=video_extensions
+        filetypes=video_extensions,
+        initialdir=os.getcwd()
     )
     
     if not video_files:
@@ -700,8 +954,17 @@ def pick_files():
     return video_files, subtitle_file if subtitle_file else None
 
 
+def clean_directory_name(dir_name):
+    """Remove square brackets and their contents from directory name."""
+    # Remove all occurrences of [content] from the directory name
+    cleaned = re.sub(r'\[.*?\]', '', dir_name)
+    # Clean up extra spaces
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+
 def process_batch_mkv(video_files):
-    """Process multiple MKV files with smart track selection and parallel processing."""
+    """Process multiple MKV files with smart track selection and sequential processing."""
     # Filter to only MKV files
     mkv_files = [f for f in video_files if Path(f).suffix.lower() == '.mkv']
     non_mkv_files = [f for f in video_files if Path(f).suffix.lower() != '.mkv']
@@ -714,6 +977,22 @@ def process_batch_mkv(video_files):
     if not mkv_files:
         print("Error: No MKV files found for batch processing.", file=sys.stderr)
         sys.exit(1)
+    
+    # Determine output directory
+    # Get parent directory of first video file (assuming all are in the same directory)
+    first_video_path = Path(mkv_files[0])
+    parent_dir = first_video_path.parent
+    parent_dir_name = parent_dir.name
+    
+    # Clean the directory name (remove square brackets and contents)
+    cleaned_dir_name = clean_directory_name(parent_dir_name)
+    
+    # Create output subdirectory
+    output_dir_name = cleaned_dir_name + "_with_subs"
+    output_dir = parent_dir / output_dir_name
+    output_dir.mkdir(exist_ok=True)
+    
+    print(f"\nOutput directory: {output_dir}")
     
     # Analyze and group files
     video_info, subtitle_groups, audio_groups = group_videos_by_tracks(mkv_files)
@@ -786,9 +1065,9 @@ def process_batch_mkv(video_files):
             print(f"Warning: No subtitle track selected for {os.path.basename(video_path)}, skipping.", file=sys.stderr)
             continue
         
-        # Determine output path
+        # Determine output path in the output subdirectory
         video_path_obj = Path(video_path)
-        output_path = str(video_path_obj.parent / (video_path_obj.stem + '_with_subs.mp4'))
+        output_path = str(output_dir / (video_path_obj.stem + '_with_subs.mp4'))
         
         processing_tasks.append((video_path, subtitle_idx, audio_idx, output_path, None))
     
@@ -796,82 +1075,32 @@ def process_batch_mkv(video_files):
         print("Error: No valid processing tasks created.", file=sys.stderr)
         sys.exit(1)
     
-    # Process in parallel
-    max_workers = min(cpu_count(), len(processing_tasks))
-    
-    # Initialize progress tracking
-    file_names = [os.path.basename(task[0]) for task in processing_tasks]
-    file_line_map = {}  # Map file names to their line numbers
-    with batch_progress_lock:
-        batch_progress.clear()
-        for name in file_names:
-            batch_progress[name] = "Starting..."
-    
-    # Print initial header and file list (only once)
+    # Process sequentially
     print("\n" + "="*60)
-    print(f"PROCESSING {len(processing_tasks)} FILE(S) IN PARALLEL")
-    print("="*60)
-    print(f"Using {max_workers} worker(s)...\n")
-    
-    # Print each file on its own line and track line numbers
-    for idx, name in enumerate(file_names):
-        print(f"{name[:45]:<45} Starting...")
-        file_line_map[name] = idx + 5  # +5 for header lines above
-    sys.stdout.flush()
-    
-    def update_file_progress(file_name, status):
-        """Update progress for a specific file on its line."""
-        if file_name not in file_line_map:
-            return
-        
-        line_num = file_line_map[file_name]
-        # Move cursor to the line, clear it, and write new status
-        # Use ANSI escape codes: \033[nA moves up n lines, \033[K clears to end of line
-        # We need to calculate how many lines from bottom
-        total_lines = len(file_names) + 5
-        lines_from_bottom = total_lines - line_num
-        
-        with batch_progress_lock:
-            batch_progress[file_name] = status
-            # Move to beginning of line, clear it, write new content
-            print(f"\033[{lines_from_bottom}A\r\033[K{file_name[:45]:<45} {status}", end='', flush=True)
-            # Move cursor back down
-            if lines_from_bottom > 0:
-                print(f"\033[{lines_from_bottom}B", end='', flush=True)
+    print(f"PROCESSING {len(processing_tasks)} FILE(S) SEQUENTIALLY")
+    print("="*60 + "\n")
     
     completed = 0
     failed = []
     
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks with update callback
-        future_to_video = {}
-        for task in processing_tasks:
-            video_path = task[0]
-            video_name = os.path.basename(video_path)
-            # Create callback for this specific file (use default parameter to avoid closure issue)
-            def make_callback(name):
-                # Callback accepts (file_name, status) but we use the captured name
-                def callback_func(file_name, status):
-                    update_file_progress(name, status)
-                return callback_func
-            callback = make_callback(video_name)
-            task_with_callback = task + (callback,)
-            future_to_video[executor.submit(process_single_video, task_with_callback)] = video_path
+    # Process each file one by one
+    for idx, task in enumerate(processing_tasks, 1):
+        video_path, subtitle_idx, audio_idx, output_path, _ = task
+        video_name = os.path.basename(video_path)
         
-        # Process completed tasks
-        for future in as_completed(future_to_video):
-            video_path, output_path, success, error = future.result()
+        print(f"[{idx}/{len(processing_tasks)}] Processing: {video_name}")
+        
+        # Process the video (without callback for simpler sequential output)
+        video_path, output_path, success, error = process_single_video(task)
+        
+        if success:
+            print(f"  ✓ Complete -> {os.path.basename(output_path)}\n")
             completed += 1
-            video_name = os.path.basename(video_path)
-            
-            if success:
-                update_file_progress(video_name, f"✓ Complete -> {os.path.basename(output_path)}")
-            else:
-                update_file_progress(video_name, f"✗ Error: {error}")
-                failed.append((video_path, error))
+        else:
+            print(f"  ✗ Error: {error}\n", file=sys.stderr)
+            failed.append((video_path, error))
     
-    # Move cursor to end
-    print("\n" + "="*60)
+    print("="*60)
     
     # Summary
     print("\n" + "="*60)
