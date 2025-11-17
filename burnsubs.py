@@ -13,6 +13,7 @@ import tempfile
 import json
 import re
 import time
+import shutil
 from pathlib import Path
 from collections import defaultdict
 
@@ -480,10 +481,39 @@ def should_convert_audio_to_aac(codec_name, output_path):
 
 def burn_subtitles_from_file(video_path, subtitle_path, output_path, audio_track_index=None, silent=False, file_name=None, update_callback=None):
     """Burn subtitles from external subtitle file into video using ffmpeg."""
+    temp_subtitle_path = None
     try:
-        # Escape the subtitle path properly for ffmpeg
-        # On Windows, we need to escape backslashes and colons
-        escaped_path = subtitle_path.replace('\\', '/').replace(':', '\\:')
+        # Ensure output directory exists
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+        
+        # On Windows, ffmpeg's subtitles filter has issues with paths containing special characters
+        # (apostrophes, spaces, etc.). To avoid escaping issues, create a temporary copy of the
+        # subtitle file in a location without special characters (temp directory).
+        subtitle_path_resolved = Path(subtitle_path).resolve()
+        
+        # Check if the path contains problematic characters that might cause issues
+        path_str = str(subtitle_path_resolved)
+        has_special_chars = ("'" in path_str or ' ' in path_str or 
+                             any(c in path_str for c in ['[', ']', '(', ')']))
+        
+        if has_special_chars:
+            # Create a temporary subtitle file with a simple name
+            # Use system temp directory to avoid any path issues
+            temp_subtitle_path = str(Path(tempfile.gettempdir()) / f"burnsubs_temp_{os.getpid()}.srt")
+            
+            # Copy the subtitle file to the temporary location
+            shutil.copy2(subtitle_path_resolved, temp_subtitle_path)
+            
+            # Use the temporary file path (much simpler, no special chars)
+            subtitle_path_to_use = temp_subtitle_path.replace('\\', '/')
+        else:
+            # Path doesn't have problematic characters, use it directly
+            subtitle_path_to_use = str(subtitle_path_resolved).replace('\\', '/')
+        
+        # Escape the path for ffmpeg filter (only need to escape colons now)
+        escaped_path = subtitle_path_to_use.replace(':', '\\:')
         
         # Get video duration for progress bar (only if not silent)
         total_duration = None
@@ -505,10 +535,15 @@ def burn_subtitles_from_file(video_path, subtitle_path, output_path, audio_track
         audio_codec, audio_channels = get_audio_codec_info(video_path, audio_track_index)
         convert_audio = should_convert_audio_to_aac(audio_codec, output_path)
         
+        # Build filter string with properly escaped path
+        # The path is wrapped in single quotes, so apostrophes inside must be escaped
+        filter_str = f"subtitles='{escaped_path}'"
+        
         cmd = [
             'ffmpeg',
             '-i', video_path,
-            '-vf', f"subtitles='{escaped_path}'",
+            '-map', '0:v:0',  # Map video stream
+            '-vf', filter_str,
             '-c:v', 'libx264',
         ]
         
@@ -557,6 +592,13 @@ def burn_subtitles_from_file(video_path, subtitle_path, output_path, audio_track
         if not silent:
             print("Error: ffmpeg not found. Please install ffmpeg.", file=sys.stderr)
         sys.exit(1)
+    finally:
+        # Clean up temporary subtitle file if it was created
+        if temp_subtitle_path and os.path.exists(temp_subtitle_path):
+            try:
+                os.unlink(temp_subtitle_path)
+            except Exception:
+                pass  # Ignore errors during cleanup
 
 
 def get_subtitle_codec(video_path, track_index):
@@ -622,7 +664,8 @@ def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_in
             cmd.extend(['-c:a', 'copy'])
         
         # Handle image-based vs text-based subtitles differently
-        escaped_video_path = video_path.replace('\\', '/').replace(':', '\\:')
+        # Escape apostrophes since path is wrapped in single quotes
+        escaped_video_path = video_path.replace('\\', '/').replace(':', '\\:').replace("'", "\\'")
         temp_sub_path = None
         
         # Check if this is VobSub - need special handling
@@ -771,7 +814,8 @@ def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_in
                 subprocess.run(extract_cmd, capture_output=True, text=True, check=True, timeout=60)
                 
                 # Try using extracted file - this will likely fail but worth trying
-                escaped_sub_path = temp_sub_path.replace('\\', '/').replace(':', '\\:')
+                # Escape apostrophes since path is wrapped in single quotes
+                escaped_sub_path = temp_sub_path.replace('\\', '/').replace(':', '\\:').replace("'", "\\'")
                 cmd.extend([
                     '-vf', f"subtitles='{escaped_sub_path}'",
                     '-c:v', 'libx264',
@@ -826,7 +870,8 @@ def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_in
                 subprocess.run(extract_cmd, capture_output=True, text=True, check=True, timeout=60)
                 
                 # Now use the extracted file with subtitles filter
-                escaped_sub_path = temp_sub_path.replace('\\', '/').replace(':', '\\:')
+                # Escape apostrophes since path is wrapped in single quotes
+                escaped_sub_path = temp_sub_path.replace('\\', '/').replace(':', '\\:').replace("'", "\\'")
                 cmd.extend([
                     '-vf', f"subtitles='{escaped_sub_path}'",
                     '-c:v', 'libx264',
@@ -1168,7 +1213,8 @@ Examples:
     if args.output_file:
         output_path = args.output_file
     else:
-        output_path = video_path.stem + '_with_subs.mp4'
+        # Output in the same directory as the input file
+        output_path = str(video_path.parent / (video_path.stem + '_with_subs.mp4'))
     
     video_path_resolved = str(video_path.resolve())
     
