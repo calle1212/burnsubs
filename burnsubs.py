@@ -24,6 +24,14 @@ try:
 except ImportError:
     TKINTER_AVAILABLE = False
 
+try:
+    import http.server
+    import socketserver
+    import threading
+    HTTP_SERVER_AVAILABLE = True
+except ImportError:
+    HTTP_SERVER_AVAILABLE = False
+
 
 def get_all_tracks(video_path):
     """Extract both subtitle and audio track information in a single ffprobe call."""
@@ -479,7 +487,135 @@ def should_convert_audio_to_aac(codec_name, output_path):
     return False
 
 
-def burn_subtitles_from_file(video_path, subtitle_path, output_path, audio_track_index=None, silent=False, file_name=None, update_callback=None):
+def find_vlc_executable():
+    """Find VLC executable on the system."""
+    # Common VLC installation paths
+    if sys.platform == 'win32':
+        common_paths = [
+            r'C:\Program Files\VideoLAN\VLC\vlc.exe',
+            r'C:\Program Files (x86)\VideoLAN\VLC\vlc.exe',
+            os.path.expanduser(r'~\AppData\Local\Programs\VideoLAN\VLC\vlc.exe'),
+        ]
+        for path in common_paths:
+            if os.path.exists(path):
+                return path
+        # Try to find in PATH
+        try:
+            result = subprocess.run(['where', 'vlc'], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip().split('\n')[0]
+        except:
+            pass
+    else:
+        # Unix-like systems
+        try:
+            result = subprocess.run(['which', 'vlc'], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except:
+            pass
+    return None
+
+
+class StreamingHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+    """Custom HTTP handler for streaming video files with range request support."""
+    def __init__(self, *args, video_file=None, **kwargs):
+        self.video_file = video_file
+        super().__init__(*args, **kwargs)
+    
+    def do_GET(self):
+        if self.path == '/' or self.path == '/video.mp4':
+            if self.video_file and os.path.exists(self.video_file):
+                file_size = os.path.getsize(self.video_file)
+                
+                # Parse Range header if present
+                range_header = self.headers.get('Range', None)
+                if range_header:
+                    # Handle range request for progressive playback
+                    byte_start = 0
+                    byte_end = file_size - 1
+                    
+                    # Parse range header (format: "bytes=start-end")
+                    match = re.match(r'bytes=(\d+)-(\d*)', range_header)
+                    if match:
+                        byte_start = int(match.group(1))
+                        if match.group(2):
+                            byte_end = int(match.group(2))
+                    
+                    # Ensure valid range
+                    byte_start = max(0, min(byte_start, file_size - 1))
+                    byte_end = max(byte_start, min(byte_end, file_size - 1))
+                    content_length = byte_end - byte_start + 1
+                    
+                    self.send_response(206)  # Partial Content
+                    self.send_header('Content-Type', 'video/mp4')
+                    self.send_header('Accept-Ranges', 'bytes')
+                    self.send_header('Content-Range', f'bytes {byte_start}-{byte_end}/{file_size}')
+                    self.send_header('Content-Length', str(content_length))
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    
+                    # Send requested byte range
+                    with open(self.video_file, 'rb') as f:
+                        f.seek(byte_start)
+                        remaining = content_length
+                        while remaining > 0:
+                            chunk_size = min(8192, remaining)
+                            chunk = f.read(chunk_size)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            remaining -= len(chunk)
+                else:
+                    # Full file request
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'video/mp4')
+                    self.send_header('Accept-Ranges', 'bytes')
+                    self.send_header('Content-Length', str(file_size))
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    
+                    # Stream the file
+                    with open(self.video_file, 'rb') as f:
+                        shutil.copyfileobj(f, self.wfile)
+            else:
+                self.send_response(404)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        # Suppress default logging for cleaner output
+        pass
+
+
+def start_streaming_server(video_file, port=8080):
+    """Start a simple HTTP server to stream the video file."""
+    if not HTTP_SERVER_AVAILABLE:
+        return None, None
+    
+    handler = lambda *args, **kwargs: StreamingHTTPRequestHandler(*args, video_file=video_file, **kwargs)
+    
+    try:
+        httpd = socketserver.TCPServer(("", port), handler)
+        httpd.allow_reuse_address = True
+        server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        server_thread.start()
+        return httpd, f"http://localhost:{port}/video.mp4"
+    except OSError:
+        # Port might be in use, try next port
+        try:
+            httpd = socketserver.TCPServer(("", port + 1), handler)
+            httpd.allow_reuse_address = True
+            server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            server_thread.start()
+            return httpd, f"http://localhost:{port + 1}/video.mp4"
+        except OSError:
+            return None, None
+
+
+def burn_subtitles_from_file(video_path, subtitle_path, output_path, audio_track_index=None, silent=False, file_name=None, update_callback=None, play_during_encode=False):
     """Burn subtitles from external subtitle file into video using ffmpeg."""
     temp_subtitle_path = None
     try:
@@ -565,10 +701,49 @@ def burn_subtitles_from_file(video_path, subtitle_path, output_path, audio_track
         else:
             cmd.extend(['-c:a', 'copy'])
         
-        cmd.extend([
-            '-y',  # Overwrite output file
-            output_path
-        ])
+        # If playing during encode, use fragmented MP4 format for progressive playback
+        if play_during_encode:
+            cmd.extend([
+                '-f', 'mp4',
+                '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+                '-y',  # Overwrite output file
+                output_path
+            ])
+        else:
+            cmd.extend([
+                '-y',  # Overwrite output file
+                output_path
+            ])
+        
+        # Start HTTP server and VLC if playing during encode
+        httpd = None
+        vlc_process = None
+        if play_during_encode:
+            # Wait a moment for file to start being written
+            # Start HTTP server
+            httpd, stream_url = start_streaming_server(output_path)
+            if httpd:
+                print(f"\nStreaming server started at: {stream_url}")
+                # Wait a bit for file to have some content
+                time.sleep(2)
+                
+                # Launch VLC
+                vlc_exe = find_vlc_executable()
+                if vlc_exe:
+                    try:
+                        vlc_process = subprocess.Popen(
+                            [vlc_exe, stream_url, '--play-and-exit'],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL
+                        )
+                        print("VLC launched - video will start playing as it's encoded...")
+                    except Exception as e:
+                        print(f"Warning: Could not launch VLC: {e}", file=sys.stderr)
+                        print(f"You can manually open {stream_url} in VLC or any media player.")
+                else:
+                    print(f"VLC not found. You can manually open {stream_url} in any media player.")
+            else:
+                print("Warning: Could not start HTTP server. Playing during encode disabled.", file=sys.stderr)
         
         process = subprocess.Popen(
             cmd,
@@ -579,6 +754,10 @@ def burn_subtitles_from_file(video_path, subtitle_path, output_path, audio_track
         
         show_progress(process, total_duration, silent=silent, file_name=file_name, update_callback=update_callback)
         process.wait()
+        
+        # Shutdown HTTP server if it was started
+        if httpd:
+            httpd.shutdown()
         
         if process.returncode != 0:
             raise subprocess.CalledProcessError(process.returncode, cmd)
@@ -612,7 +791,7 @@ def get_subtitle_codec(video_path, track_index):
         return None
 
 
-def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_index=None, silent=False, file_name=None, update_callback=None):
+def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_index=None, silent=False, file_name=None, update_callback=None, play_during_encode=False):
     """Burn subtitles directly from MKV file using track index (more efficient)."""
     try:
         # Check if subtitle is image-based
@@ -670,6 +849,8 @@ def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_in
         
         # Check if this is VobSub - need special handling
         is_vobsub = subtitle_codec and ('dvd_subtitle' in subtitle_codec.lower() or 'vobsub' in subtitle_codec.lower())
+        handbrake_available = False
+        used_handbrake = False
         
         if is_vobsub:
             # For VobSub, FFmpeg's subtitles filter doesn't support it
@@ -683,6 +864,7 @@ def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_in
                 handbrake_available = False
             
             if handbrake_available:
+                used_handbrake = True
                 # Use HandBrake CLI to burn VobSub subtitles
                 if not silent:
                     print("Using HandBrake CLI to process VobSub subtitles...")
@@ -787,6 +969,7 @@ def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_in
                 if process.returncode == 0:
                     return True
                 else:
+                    used_handbrake = False  # HandBrake failed, will use FFmpeg
                     if not silent:
                         print(f"\nHandBrake processing failed. Trying FFmpeg fallback...", file=sys.stderr)
                     # Fall through to FFmpeg attempt
@@ -900,12 +1083,80 @@ def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_in
                 raise subprocess.CalledProcessError(1, extract_cmd if 'extract_cmd' in locals() else [])
         else:
             # For text-based subtitles, use the subtitles filter directly
-            cmd.extend([
-                '-vf', f"subtitles='{escaped_video_path}':si={track_index}",
-                '-c:v', 'libx264',
-                '-y',  # Overwrite output file
-                output_path
-            ])
+            if play_during_encode:
+                cmd.extend([
+                    '-vf', f"subtitles='{escaped_video_path}':si={track_index}",
+                    '-c:v', 'libx264',
+                    '-f', 'mp4',
+                    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+                    '-y',  # Overwrite output file
+                    output_path
+                ])
+            else:
+                cmd.extend([
+                    '-vf', f"subtitles='{escaped_video_path}':si={track_index}",
+                    '-c:v', 'libx264',
+                    '-y',  # Overwrite output file
+                    output_path
+                ])
+        
+        # For image-based subtitles (PGS), add fragmented MP4 if playing during encode
+        if play_during_encode and is_image_based and not is_vobsub:
+            # Find output_path in cmd and insert format flags before it
+            for i in range(len(cmd) - 1, -1, -1):
+                if cmd[i] == output_path and i > 0 and cmd[i-1] == '-y':
+                    # Insert format flags before -y
+                    cmd.insert(i-1, 'default_base_moof')
+                    cmd.insert(i-1, 'empty_moov+')
+                    cmd.insert(i-1, 'frag_keyframe+')
+                    cmd.insert(i-1, '-movflags')
+                    cmd.insert(i-1, 'mp4')
+                    cmd.insert(i-1, '-f')
+                    break
+        
+        # For VobSub fallback path, also add fragmented MP4 if playing during encode
+        if play_during_encode and is_vobsub and temp_sub_path:
+            # Find output_path in cmd and insert format flags before it
+            for i in range(len(cmd) - 1, -1, -1):
+                if cmd[i] == output_path and i > 0 and cmd[i-1] == '-y':
+                    # Insert format flags before -y
+                    cmd.insert(i-1, 'default_base_moof')
+                    cmd.insert(i-1, 'empty_moov+')
+                    cmd.insert(i-1, 'frag_keyframe+')
+                    cmd.insert(i-1, '-movflags')
+                    cmd.insert(i-1, 'mp4')
+                    cmd.insert(i-1, '-f')
+                    break
+        
+        # Start HTTP server and VLC if playing during encode (only for FFmpeg paths, not HandBrake)
+        httpd = None
+        vlc_process = None
+        if play_during_encode and not used_handbrake:
+            # Wait a moment for file to start being written
+            # Start HTTP server
+            httpd, stream_url = start_streaming_server(output_path)
+            if httpd:
+                print(f"\nStreaming server started at: {stream_url}")
+                # Wait a bit for file to have some content
+                time.sleep(2)
+                
+                # Launch VLC
+                vlc_exe = find_vlc_executable()
+                if vlc_exe:
+                    try:
+                        vlc_process = subprocess.Popen(
+                            [vlc_exe, stream_url, '--play-and-exit'],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL
+                        )
+                        print("VLC launched - video will start playing as it's encoded...")
+                    except Exception as e:
+                        print(f"Warning: Could not launch VLC: {e}", file=sys.stderr)
+                        print(f"You can manually open {stream_url} in VLC or any media player.")
+                else:
+                    print(f"VLC not found. You can manually open {stream_url} in any media player.")
+            else:
+                print("Warning: Could not start HTTP server. Playing during encode disabled.", file=sys.stderr)
         
         process = subprocess.Popen(
             cmd,
@@ -916,6 +1167,10 @@ def burn_subtitles_from_mkv(video_path, track_index, output_path, audio_track_in
         
         show_progress(process, total_duration, silent=silent, file_name=file_name, update_callback=update_callback)
         process.wait()
+        
+        # Shutdown HTTP server if it was started
+        if httpd:
+            httpd.shutdown()
         
         # Clean up temporary subtitle file if it was created
         if 'temp_sub_path' in locals() and temp_sub_path and os.path.exists(temp_sub_path):
@@ -1174,6 +1429,8 @@ Examples:
                        help='External subtitle file (optional, will use embedded subtitles from MKV if not provided)')
     parser.add_argument('-o', '--output', dest='output_file',
                        help='Output video file (default: input_filename_with_subs.mp4) - only for single file')
+    parser.add_argument('--play-during-encode', dest='play_during_encode', action='store_true',
+                       help='Play video in VLC while encoding (uses fragmented MP4 format for progressive playback)')
     
     args = parser.parse_args()
     
@@ -1239,7 +1496,7 @@ Examples:
         print(f"\nBurning subtitles from external file into video...")
         print(f"Output will be saved as: {output_path}")
         
-        if not burn_subtitles_from_file(video_path_resolved, subtitle_path, output_path, audio_track_index):
+        if not burn_subtitles_from_file(video_path_resolved, subtitle_path, output_path, audio_track_index, play_during_encode=args.play_during_encode):
             sys.exit(1)
     else:
         # Try to use embedded subtitles from video file (for MKV files)
@@ -1258,7 +1515,7 @@ Examples:
             print(f"\nBurning subtitles into video...")
             print(f"Output will be saved as: {output_path}")
             
-            if not burn_subtitles_from_mkv(video_path_resolved, subtitle_track_index, output_path, audio_track_index):
+            if not burn_subtitles_from_mkv(video_path_resolved, subtitle_track_index, output_path, audio_track_index, play_during_encode=args.play_during_encode):
                 sys.exit(1)
         else:
             print("Error: No subtitle file provided and video file doesn't appear to have embedded subtitles.", file=sys.stderr)
