@@ -1,0 +1,45 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Debug burnsubs.py (batch with streaming)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/burnsubs.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--play-during-encode",
+                "D:\\Film\\Japan\\Azumanga Daioh\\Azumanga Daioh - Episode 01 - Miss Yukari.mkv",
+                "D:\\Film\\Japan\\Azumanga Daioh\\Azumanga Daioh - Episode 02 - Osaka Day.mkv"
+            ],
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Python: Debug burnsubs.py (file picker)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/burnsubs.py",
+            "console": "integratedTerminal",
+            "args": [],
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Python: Debug burnsubs.py (single file)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/burnsubs.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--play-during-encode",
+                "D:\\Film\\Japan\\Azumanga Daioh\\Azumanga Daioh - Episode 01 - Miss Yukari.mkv"
+            ],
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
+
+
+
