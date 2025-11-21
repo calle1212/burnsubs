@@ -1263,7 +1263,39 @@ def clean_directory_name(dir_name):
     return cleaned
 
 
-def process_batch_mkv(video_files):
+def save_burnsubs_metadata(video_path, output_path):
+    """Save metadata indicating that burnsubs has been run on this video.
+    Metadata tracks the INPUT video file, so we know it's been processed."""
+    try:
+        folder_path = os.path.dirname(video_path)
+        video_name = os.path.basename(video_path)
+        metadata_file = os.path.join(folder_path, '.burnsubs_metadata.json')
+        
+        # Load existing metadata
+        metadata = {}
+        if os.path.exists(metadata_file):
+            try:
+                with open(metadata_file, 'r', encoding='utf-8') as f:
+                    metadata = json.load(f)
+            except:
+                metadata = {}
+        
+        # Add entry for the INPUT file (so we know it's been processed)
+        metadata[video_name] = {
+            'processed': True,
+            'output_file': os.path.basename(output_path),
+            'timestamp': time.time()
+        }
+        
+        # Save metadata
+        with open(metadata_file, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        # Don't fail if metadata writing fails
+        print(f"Warning: Could not save metadata: {e}", file=sys.stderr)
+
+
+def process_batch_mkv(video_files, play_during_encode=False):
     """Process multiple MKV files with smart track selection and sequential processing."""
     # Filter to only MKV files
     mkv_files = [f for f in video_files if Path(f).suffix.lower() == '.mkv']
@@ -1369,7 +1401,7 @@ def process_batch_mkv(video_files):
         video_path_obj = Path(video_path)
         output_path = str(output_dir / (video_path_obj.stem + '_with_subs.mp4'))
         
-        processing_tasks.append((video_path, subtitle_idx, audio_idx, output_path, None))
+        processing_tasks.append((video_path, subtitle_idx, audio_idx, output_path, None, None, play_during_encode))
     
     if not processing_tasks:
         print("Error: No valid processing tasks created.", file=sys.stderr)
@@ -1396,6 +1428,8 @@ def process_batch_mkv(video_files):
         if success:
             print(f"  ✓ Complete -> {os.path.basename(output_path)}\n")
             completed += 1
+            # Save metadata indicating video was processed
+            save_burnsubs_metadata(video_path, output_path)
         else:
             print(f"  ✗ Error: {error}\n", file=sys.stderr)
             failed.append((video_path, error))
@@ -1460,7 +1494,7 @@ Examples:
     # Batch processing (multiple files)
     if len(valid_files) > 1:
         # Batch processing only supports MKV files with embedded subtitles
-        process_batch_mkv(valid_files)
+        process_batch_mkv(valid_files, play_during_encode=args.play_during_encode)
         return
     
     # Single file processing
@@ -1473,7 +1507,19 @@ Examples:
         # Output in the same directory as the input file
         output_path = str(video_path.parent / (video_path.stem + '_with_subs.mp4'))
     
+    # Safety check: ensure output path is different from input path
+    output_path_resolved = str(Path(output_path).resolve())
     video_path_resolved = str(video_path.resolve())
+    
+    if output_path_resolved == video_path_resolved:
+        print(f"Error: Output file cannot be the same as input file!", file=sys.stderr)
+        print(f"Input:  {video_path_resolved}", file=sys.stderr)
+        print(f"Output: {output_path_resolved}", file=sys.stderr)
+        print(f"\nPlease specify a different output file with -o option.", file=sys.stderr)
+        sys.exit(1)
+    
+    # Use the resolved output path
+    output_path = output_path_resolved
     
     # Determine if this is an MKV file (for interactive track selection)
     is_mkv = video_path.suffix.lower() == '.mkv'
@@ -1498,6 +1544,9 @@ Examples:
         
         if not burn_subtitles_from_file(video_path_resolved, subtitle_path, output_path, audio_track_index, play_during_encode=args.play_during_encode):
             sys.exit(1)
+        
+        # Save metadata indicating video was processed
+        save_burnsubs_metadata(video_path_resolved, output_path)
     else:
         # Try to use embedded subtitles from video file (for MKV files)
         if is_mkv:
@@ -1505,18 +1554,66 @@ Examples:
             subtitle_track_index = select_subtitle_track(video_path_resolved)
             
             if subtitle_track_index is None:
-                print("Error: No subtitle tracks found in video file.", file=sys.stderr)
-                sys.exit(1)
-            
-            # Allow audio track selection
-            audio_track_index = select_audio_track(video_path_resolved)
-            
-            # Burn subtitles directly from MKV (more efficient than extracting first)
-            print(f"\nBurning subtitles into video...")
-            print(f"Output will be saved as: {output_path}")
-            
-            if not burn_subtitles_from_mkv(video_path_resolved, subtitle_track_index, output_path, audio_track_index, play_during_encode=args.play_during_encode):
-                sys.exit(1)
+                # No embedded subtitles found - ask user to provide one
+                print("\nNo embedded subtitle tracks found in this video file.")
+                if TKINTER_AVAILABLE:
+                    print("Please select a subtitle file to use...")
+                    root = tk.Tk()
+                    root.withdraw()
+                    root.attributes('-topmost', True)
+                    
+                    subtitle_extensions = [
+                        ('Subtitle files', '*.srt *.ass *.ssa *.vtt *.sub'),
+                        ('All files', '*.*')
+                    ]
+                    
+                    subtitle_file = filedialog.askopenfilename(
+                        title="Select Subtitle File (Required)",
+                        filetypes=subtitle_extensions,
+                        initialdir=str(video_path.parent)
+                    )
+                    root.destroy()
+                    
+                    if not subtitle_file:
+                        print("Error: No subtitle file selected. Exiting.", file=sys.stderr)
+                        sys.exit(1)
+                    
+                    subtitle_path = Path(subtitle_file)
+                    if not subtitle_path.exists():
+                        print(f"Error: Subtitle file '{subtitle_file}' not found.", file=sys.stderr)
+                        sys.exit(1)
+                    subtitle_path = str(subtitle_path.resolve())
+                    
+                    # Allow audio track selection
+                    audio_track_index = select_audio_track(video_path_resolved)
+                    
+                    # Burn subtitles from external file
+                    print(f"\nBurning subtitles from external file into video...")
+                    print(f"Output will be saved as: {output_path}")
+                    
+                    if not burn_subtitles_from_file(video_path_resolved, subtitle_path, output_path, audio_track_index, play_during_encode=args.play_during_encode):
+                        sys.exit(1)
+                    
+                    # Save metadata indicating video was processed
+                    save_burnsubs_metadata(video_path_resolved, output_path)
+                else:
+                    print("Error: No subtitle tracks found in video file.", file=sys.stderr)
+                    print("Please provide a subtitle file with -s option.", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                # Embedded subtitles found - proceed normally
+                # Allow audio track selection
+                audio_track_index = select_audio_track(video_path_resolved)
+                
+                # Burn subtitles directly from MKV (more efficient than extracting first)
+                print(f"\nBurning subtitles into video...")
+                print(f"Output will be saved as: {output_path}")
+                
+                if not burn_subtitles_from_mkv(video_path_resolved, subtitle_track_index, output_path, audio_track_index, play_during_encode=args.play_during_encode):
+                    sys.exit(1)
+                
+                # Save metadata indicating video was processed
+                save_burnsubs_metadata(video_path_resolved, output_path)
         else:
             print("Error: No subtitle file provided and video file doesn't appear to have embedded subtitles.", file=sys.stderr)
             print("Please provide a subtitle file with -s option.", file=sys.stderr)
